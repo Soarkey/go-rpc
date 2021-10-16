@@ -1,13 +1,13 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
-	"gorpc/codec"
+	"gorpc/app"
 )
 
 func startServer(addr chan string) {
@@ -18,45 +18,37 @@ func startServer(addr chan string) {
 	}
 	log.Println("启动rpc服务器 ", lis.Addr())
 	addr <- lis.Addr().String()
-	Accept(lis)
+	app.Accept(lis)
 }
 
 func main() {
 	addr := make(chan string)
 	go startServer(addr)
 
-	conn, err := net.Dial("tcp", <-addr)
-	if err != nil {
-		log.Fatalln("tcp拨号连接失败 err: ", err)
-		return
-	}
+	client, err := app.Dial("tcp", <-addr)
 	defer func() {
-		_ = conn.Close()
+		_ = client.Close()
+		if err != nil {
+			log.Fatalln("tcp拨号连接失败 err: ", err)
+		}
 	}()
 
 	time.Sleep(time.Second)
 
-	// 发送Option
-	_ = json.NewEncoder(conn).Encode(DefaultOption)
-	c := codec.NewGobCodec(conn)
-
-	log.Println("发送Option: ", DefaultOption)
-
 	// 发送请求 & 接收响应
+	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "Foo.Sum",
-			Seq:           uint64(i),
-		}
-
-		_ = c.Write(h, fmt.Sprintf("gorpc req %d", h.Seq))
-		_ = c.ReadHeader(h)
-
-		var reply string
-		_ = c.ReadBody(&reply)
-
-		log.Println("响应信息: ", reply)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := fmt.Sprintf("rpc req %d", i)
+			var reply string
+			if err = client.Call("Foo.Sum", args, &reply); err != nil {
+				log.Fatalln("call Foo.Sum error: ", err)
+			}
+			log.Println("reply: ", reply)
+		}(i)
 	}
-
+	wg.Wait()
 	log.Println("程序运行完毕!")
 }
