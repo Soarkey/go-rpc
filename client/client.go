@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,10 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"gorpc/codec"
-	"gorpc/server"
+	"gorpc/option"
 )
 
 // Call 承载一次 rpc 调用
@@ -33,7 +35,7 @@ func (c *Call) done() {
 // 并且被多个goroutine运行的情况
 type Client struct {
 	cc       codec.Codec      // 消息编解码器, 序列化将要发送出去的请求，以及反序列化接收到的响应
-	opt      *server.Option   // rpc的参数, 包含魔数和 codec.Type
+	opt      *option.Option   // rpc的参数, 包含魔数和 codec.Type
 	sending  sync.Mutex       // 保证请求的有序发送, 避免出现多个请求报文混淆
 	header   codec.Header     // 每个请求的消息头, 只有在请求发送时才需要, 而请求发送是互斥的, 因此每个客户端只需要一个
 	mu       sync.Mutex       // 全局互斥锁, 保证操作的完整性
@@ -184,13 +186,19 @@ func (c *Client) Go(ServiceMethod string, args, reply interface{}, done chan *Ca
 }
 
 // Call 同步调用 Go, 阻塞等待发送完成
-func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		return errors.New("rpc client: 调用失败 " + ctx.Err().Error())
+	case call = <-call.Done:
+		return call.Error
+	}
 }
 
 // NewClient 创建 rpc 客户端实例
-func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *option.Option) (*Client, error) {
 	// 通过 opt.CodecType 获取编解码函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
@@ -200,14 +208,14 @@ func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 	}
 	// 对 opt 进行编码
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
-		log.Println("rpc client: options encode error ", err)
+		log.Println("rpc client: option encode error ", err)
 		_ = conn.Close()
 		return nil, err
 	}
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
+func newClientCodec(cc codec.Codec, opt *option.Option) *Client {
 	client := &Client{
 		cc:      cc,
 		opt:     opt,
@@ -220,36 +228,61 @@ func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 }
 
 // parseOptions 简化用户调用, ...*Option 将 Option 设为可选参数
-func parseOptions(opts ...*server.Option) (*server.Option, error) {
+func parseOptions(opts ...*option.Option) (*option.Option, error) {
 	if len(opts) == 0 || opts[0] == nil {
-		return server.DefaultOption, nil
+		return option.DefaultOption, nil
 	}
 	if len(opts) != 1 {
 		return nil, errors.New("opts 参数数量不能超过1")
 	}
 	opt := opts[0]
-	opt.MagicNumber = server.DefaultOption.MagicNumber
+	opt.MagicNumber = option.DefaultOption.MagicNumber
 	if opt.CodecType == "" {
-		opt.CodecType = server.DefaultOption.CodecType
+		opt.CodecType = option.DefaultOption.CodecType
 	}
 	return opt, nil
 }
 
-// Dial 通过 network 和 address 连接 rpc 服务器
-func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *option.Option) (client *Client, err error)
+
+func dialTimout(f newClientFunc, network, address string, opts ...*option.Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-	// 当 client 为空时, 关闭连接 conn
 	defer func() {
-		if client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	ch := make(chan clientResult)
+	go func() {
+		client, err = f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	// 默认不设超时限制
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: 连接超时, 超时时间为%s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+// Dial 通过 network 和 address 连接 rpc 服务器
+func Dial(network, address string, opts ...*option.Option) (client *Client, err error) {
+	return dialTimout(NewClient, network, address, opts...)
 }

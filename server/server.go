@@ -3,28 +3,18 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"gorpc/codec"
+	"gorpc/option"
 )
-
-// MagicNumber 魔数
-const MagicNumber = 0x3bef5c
-
-type Option struct {
-	MagicNumber int        // 魔数, 标记这是一个go-rpc自定义请求
-	CodecType   codec.Type // client端可以选择不同的Codec来编码body
-}
-
-var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
-}
 
 // | Option{MagicNumber: xxx, CodecType: xxx} | Header{ServiceMethod ...} | Body interface{} |
 // | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定   ------->|
@@ -84,8 +74,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() {
 		_ = conn.Close()
 	}()
-
-	var opt Option
+	var opt option.Option
 	// 首先使用 json.NewDecoder 反序列化得到 Option 实例
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Fatalln("rpc server: 反序列化Option出错 err: ", err)
@@ -93,7 +82,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 	// 检查 MagicNumber 和 CodeType 的值是否正确,
 	// 根据 CodeType 得到对应的消息编解码器
-	if opt.MagicNumber != MagicNumber {
+	if opt.MagicNumber != option.MagicNumber {
 		log.Fatalf("rpc server: 非法魔数 %x\n", opt.MagicNumber)
 		return
 	}
@@ -102,7 +91,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Fatalf("rpc server: 非法CodecType %s\n", opt.CodecType)
 		return
 	}
-	s.serveCodec(f(conn))
+	s.serveCodec(f(conn), &opt)
 }
 
 // invalidRequest 当响应argv出错时设置
@@ -121,7 +110,7 @@ type request struct {
 // 1.handleRequest 使用了协程并发执行请求
 // 2.处理请求是并发的, 但是回复请求的报文必须是逐个发送的, 并发容易导致多个回复报文交织在一起, 客户端无法解析, 在这里使用锁(sending)保证
 // 3.尽力而为, 只有在 header 解析失败时, 才终止循环
-func (s *Server) serveCodec(c codec.Codec) {
+func (s *Server) serveCodec(c codec.Codec, opt *option.Option) {
 	// 加锁确保发送一条完整的消息
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
@@ -140,23 +129,42 @@ func (s *Server) serveCodec(c codec.Codec) {
 		}
 		wg.Add(1)
 		// 处理请求
-		go s.handleRequest(c, req, sending, wg)
+		go s.handleRequest(c, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = c.Close()
 }
 
 // handleRequest 处理请求
-func (s *Server) handleRequest(c codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(c codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	log.Printf("请求信息: >> [请求头 %v / 请求体 %v]\n", req.h, req.argv)
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(c, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		log.Printf("请求信息: >> [请求头 %v / 请求体 %v]\n", req.h, req.argv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(c, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		s.sendResponse(c, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	s.sendResponse(c, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: 处理请求超时, 超时时间为%s", timeout)
+		s.sendResponse(c, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 // readRequest 读取请求

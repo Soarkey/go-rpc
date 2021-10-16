@@ -16,3 +16,8 @@
 
 - 利用反射构建Service的注册
 - 集成到服务端实现服务的注册和调用
+
+# 4.超时处理
+
+- 设定连接超时和处理超时两个字段
+- 利用select + channel + context.WithTimeout实现超时处理
