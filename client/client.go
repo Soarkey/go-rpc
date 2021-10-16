@@ -1,4 +1,4 @@
-package app
+package client
 
 import (
 	"encoding/json"
@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"gorpc/codec"
+	"gorpc/server"
 )
 
 // Call 承载一次 rpc 调用
@@ -32,7 +33,7 @@ func (c *Call) done() {
 // 并且被多个goroutine运行的情况
 type Client struct {
 	cc       codec.Codec      // 消息编解码器, 序列化将要发送出去的请求，以及反序列化接收到的响应
-	opt      *Option          // rpc的参数, 包含魔数和 codec.Type
+	opt      *server.Option   // rpc的参数, 包含魔数和 codec.Type
 	sending  sync.Mutex       // 保证请求的有序发送, 避免出现多个请求报文混淆
 	header   codec.Header     // 每个请求的消息头, 只有在请求发送时才需要, 而请求发送是互斥的, 因此每个客户端只需要一个
 	mu       sync.Mutex       // 全局互斥锁, 保证操作的完整性
@@ -189,7 +190,7 @@ func (c *Client) Call(serviceMethod string, args, reply interface{}) error {
 }
 
 // NewClient 创建 rpc 客户端实例
-func NewClient(conn net.Conn, opt *Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 	// 通过 opt.CodecType 获取编解码函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
@@ -206,7 +207,7 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(cc codec.Codec, opt *Option) *Client {
+func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 	client := &Client{
 		cc:      cc,
 		opt:     opt,
@@ -219,23 +220,23 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 }
 
 // parseOptions 简化用户调用, ...*Option 将 Option 设为可选参数
-func parseOptions(opts ...*Option) (*Option, error) {
+func parseOptions(opts ...*server.Option) (*server.Option, error) {
 	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
+		return server.DefaultOption, nil
 	}
 	if len(opts) != 1 {
 		return nil, errors.New("opts 参数数量不能超过1")
 	}
 	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
+	opt.MagicNumber = server.DefaultOption.MagicNumber
 	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
+		opt.CodecType = server.DefaultOption.CodecType
 	}
 	return opt, nil
 }
 
 // Dial 通过 network 和 address 连接 rpc 服务器
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err

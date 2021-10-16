@@ -1,12 +1,13 @@
-package app
+package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"gorpc/codec"
@@ -29,7 +30,41 @@ var DefaultOption = &Option{
 // | <------      固定 JSON 编码      ------>  | <-------   编码方式由 CodeType 决定   ------->|
 
 // Server 表示一个RPC服务器
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
+
+// Register 服务注册
+func (s *Server) Register(rcvr interface{}) error {
+	svc := newService(rcvr)
+	if _, dup := s.serviceMap.LoadOrStore(svc.name, svc); dup {
+		return errors.New("rpc: 服务已经被定义 " + svc.name)
+	}
+	return nil
+}
+
+// findService 通过服务名找到对应的方法
+func (s *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	// serviceMethod的组成为 Service.Method
+	// 根据 . 分割两个部分
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method 请求不符合格式 " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: 找不到服务 " + serviceName)
+		return
+	}
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: 找不到方法 " + serviceName)
+	}
+	return
+}
 
 // Accept 接收 net.Listener 中的连接
 func (s *Server) Accept(lis net.Listener) {
@@ -75,8 +110,10 @@ var invalidRequest = struct{}{}
 
 // request 存储一次请求的所有信息
 type request struct {
-	h            *codec.Header
-	argv, replyv reflect.Value
+	h            *codec.Header // 请求头
+	argv, replyv reflect.Value // 参数和返回值
+	mtype        *methodType
+	svc          *service
 }
 
 // serveCodec 解析消息
@@ -112,8 +149,13 @@ func (s *Server) serveCodec(c codec.Codec) {
 // handleRequest 处理请求
 func (s *Server) handleRequest(c codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Printf("请求信息:\n >> 请求头 %v \n >> 请求体 %v\n", req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("go-rpc resp %d", req.h.Seq))
+	log.Printf("请求信息: >> [请求头 %v / 请求体 %v]\n", req.h, req.argv)
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		s.sendResponse(c, req.h, invalidRequest, sending)
+		return
+	}
 	s.sendResponse(c, req.h, req.replyv.Interface(), sending)
 }
 
@@ -124,9 +166,21 @@ func (s *Server) readRequest(c codec.Codec) (*request, error) {
 		return nil, err
 	}
 	req := &request{h: h}
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = c.ReadBody(req.argv.Interface()); err != nil {
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	// 构造参数
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+	argvi := req.argv.Interface()
+	// 确保 argvi 是指针类型, ReadBody 需要指针作为参数
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = c.ReadBody(argvi); err != nil {
 		log.Fatalln("rpc server: 读取argv出错 err: ", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -162,4 +216,9 @@ var DefaultServer = NewServer()
 // Accept 接收连接并响应请求
 func Accept(lis net.Listener) {
 	DefaultServer.Accept(lis)
+}
+
+// Register 服务注册
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
 }
