@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 
-	"gorpc/client"
 	"gorpc/server"
+	"gorpc/xclient"
 )
 
 type Foo int
@@ -22,54 +22,91 @@ func (f Foo) Sum(args Args, reply *int) error {
 	return nil
 }
 
+func (f Foo) Sleep(args Args, reply *int) error {
+	time.Sleep(time.Duration(args.Num1) * time.Second)
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
 func startServer(addr chan string) {
 	// 注意: 在 startServer 中使用了信道 addr, 确保服务端端口监听成功, 客户端再发起请求
-	lis, err := net.Listen("tcp", ":9999")
+	lis, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatalln("网络出现错误 err: ", err)
 	}
+	s := server.NewServer()
 	var foo Foo
-	if err = server.Register(&foo); err != nil {
-		log.Fatalln("服务注册错误 ", err)
-	}
-	server.HandleHTTP()
+	_ = s.Register(&foo)
 	log.Println("启动rpc服务器 ", lis.Addr())
 	addr <- lis.Addr().String()
-	if err = http.Serve(lis, nil); err != nil {
-		log.Fatalln("监听出现错误 ", err)
-	}
+	s.Accept(lis)
 }
 
-func call(addr chan string) {
-	c, err := client.DialHTTP("tcp", <-addr)
+func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, args *Args) {
+	var (
+		reply int
+		err   error
+	)
+	switch typ {
+	case "call":
+		err = xc.Call(ctx, serviceMethod, args, &reply)
+	case "broadcast":
+		err = xc.Broadcast(ctx, serviceMethod, args, &reply)
+	}
+	if err != nil {
+		log.Printf("%s %s error: %v", typ, serviceMethod, err)
+		return
+	}
+	log.Printf("%s %s success: %d + %d = %d", typ, serviceMethod, args.Num1, args.Num2, reply)
+}
+
+// simulateCall 模拟调用
+func simulateCall(addr []string, typ string) {
+	for i := range addr {
+		addr[i] = "tcp@" + addr[i]
+	}
+	// 手动注册服务
+	d := xclient.NewMultiServersDiscovery(addr)
+	// 创建带负载均衡的客户端
+	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer func() {
-		_ = c.Close()
-		if err != nil {
-			log.Fatalln("tcp拨号连接失败 err: ", err)
-		}
+		_ = xc.Close()
 	}()
-	time.Sleep(time.Second)
-	// 发送请求 & 接收响应
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			args := &Args{Num1: i, Num2: i + 1}
-			var reply int
-			if err = c.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
-				log.Fatalln("调用 Foo.Sum 出错 err: ", err)
+			foo(xc, context.Background(), typ, "Foo.Sum", &Args{Num1: i, Num2: i + 1})
+			if typ == "broadcast" {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				foo(xc, ctx, typ, "Foo.Sleep", &Args{Num1: i, Num2: i + 1})
 			}
-			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
 		}(i)
-		time.Sleep(time.Second)
 	}
 	wg.Wait()
 }
 
 func main() {
 	log.SetFlags(0)
-	ch := make(chan string)
-	go call(ch)
-	startServer(ch)
+	ch1 := make(chan string)
+	ch2 := make(chan string)
+	// 启动两个服务
+	go startServer(ch1)
+	go startServer(ch2)
+	addr1 := <-ch1
+	addr2 := <-ch2
+
+	done := make(chan struct{})
+	fmt.Println("-----------------  call  -----------------")
+	time.Sleep(time.Second)
+	go func() {
+		simulateCall([]string{addr1, addr2}, "call")
+		done <- struct{}{}
+	}()
+	<-done
+	fmt.Println("-----------------  broadcast  -----------------")
+	time.Sleep(time.Second)
+	simulateCall([]string{addr1, addr2}, "broadcast")
 }
