@@ -67,7 +67,7 @@ func (m *MultiServersDiscovery) GetAll() ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	// 拷贝一份新的实例列表, 避免误修改
-	servers := make([]string, len(m.servers))
+	servers := make([]string, 0, len(m.servers))
 	copy(servers, m.servers)
 	return servers, nil
 }

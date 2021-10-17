@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
+	"gorpc/registry"
 	"gorpc/server"
 	"gorpc/xclient"
 )
@@ -28,7 +30,14 @@ func (f Foo) Sleep(args Args, reply *int) error {
 	return nil
 }
 
-func startServer(addr chan string) {
+func startRegistry(wg *sync.WaitGroup) {
+	lis, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(lis, nil)
+}
+
+func startServer(registryAddr string, wg *sync.WaitGroup) {
 	// 注意: 在 startServer 中使用了信道 addr, 确保服务端端口监听成功, 客户端再发起请求
 	lis, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -37,8 +46,9 @@ func startServer(addr chan string) {
 	s := server.NewServer()
 	var foo Foo
 	_ = s.Register(&foo)
+	registry.Heartbeat(registryAddr, "tcp@"+lis.Addr().String(), 0)
 	log.Println("启动rpc服务器 ", lis.Addr())
-	addr <- lis.Addr().String()
+	wg.Done()
 	s.Accept(lis)
 }
 
@@ -61,12 +71,9 @@ func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, ar
 }
 
 // simulateCall 模拟调用
-func simulateCall(addr []string, typ string) {
-	for i := range addr {
-		addr[i] = "tcp@" + addr[i]
-	}
-	// 手动注册服务
-	d := xclient.NewMultiServersDiscovery(addr)
+func simulateCall(registry, typ string, owg *sync.WaitGroup) {
+	// 创建服务注册中心
+	d := xclient.NewGoRegistryDiscovery(registry, 0)
 	// 创建带负载均衡的客户端
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer func() {
@@ -86,27 +93,36 @@ func simulateCall(addr []string, typ string) {
 		}(i)
 	}
 	wg.Wait()
+	if owg != nil {
+		owg.Done()
+	}
 }
 
 func main() {
 	log.SetFlags(0)
-	ch1 := make(chan string)
-	ch2 := make(chan string)
-	// 启动两个服务
-	go startServer(ch1)
-	go startServer(ch2)
-	addr1 := <-ch1
-	addr2 := <-ch2
+	registryAddr := "http://localhost:9999/_gorpc_/registry"
+	// 启动注册中心
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
+	time.Sleep(2 * time.Second)
 
-	done := make(chan struct{})
-	fmt.Println("-----------------  call  -----------------")
-	time.Sleep(time.Second)
-	go func() {
-		simulateCall([]string{addr1, addr2}, "call")
-		done <- struct{}{}
-	}()
-	<-done
-	fmt.Println("-----------------  broadcast  -----------------")
-	time.Sleep(time.Second)
-	simulateCall([]string{addr1, addr2}, "broadcast")
+	// 启动多个服务
+	wg.Add(3)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
+	wg.Wait()
+
+	time.Sleep(2 * time.Second)
+
+	wg.Add(1)
+	go simulateCall(registryAddr, "call", &wg)
+	wg.Wait()
+	time.Sleep(2 * time.Second)
+	fmt.Println("-----------------------------------------------")
+	wg.Add(1)
+	simulateCall(registryAddr, "broadcast", &wg)
+	wg.Wait()
 }

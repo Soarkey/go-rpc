@@ -316,7 +316,7 @@ func DialHTTP(network, address string, opts ...*option.Option) (*Client, error) 
 func XDial(rpcAddr string, opts ...*option.Option) (*Client, error) {
 	parts := strings.Split(rpcAddr, "@")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("rpc client: 错误的格式 '%s', 应当为 protocol@addr", rpcAddr)
+		return nil, fmt.Errorf("rpc client: 错误的格式 '%v', 应当为 protocol@addr", rpcAddr)
 	}
 	protocol, addr := parts[0], parts[1]
 	switch protocol {
