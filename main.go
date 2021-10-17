@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -22,35 +23,32 @@ func (f Foo) Sum(args Args, reply *int) error {
 }
 
 func startServer(addr chan string) {
-	var foo Foo
-	if err := server.Register(&foo); err != nil {
-		log.Fatalln("服务注册错误 ", err)
-	}
 	// 注意: 在 startServer 中使用了信道 addr, 确保服务端端口监听成功, 客户端再发起请求
-	lis, err := net.Listen("tcp", ":0")
+	lis, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		log.Fatalln("网络出现错误 err: ", err)
 	}
+	var foo Foo
+	if err = server.Register(&foo); err != nil {
+		log.Fatalln("服务注册错误 ", err)
+	}
+	server.HandleHTTP()
 	log.Println("启动rpc服务器 ", lis.Addr())
 	addr <- lis.Addr().String()
-	server.Accept(lis)
+	if err = http.Serve(lis, nil); err != nil {
+		log.Fatalln("监听出现错误 ", err)
+	}
 }
 
-func main() {
-	log.SetFlags(0)
-	addr := make(chan string)
-	go startServer(addr)
-
-	client, err := client.Dial("tcp", <-addr)
+func call(addr chan string) {
+	c, err := client.DialHTTP("tcp", <-addr)
 	defer func() {
-		_ = client.Close()
+		_ = c.Close()
 		if err != nil {
 			log.Fatalln("tcp拨号连接失败 err: ", err)
 		}
 	}()
-
 	time.Sleep(time.Second)
-
 	// 发送请求 & 接收响应
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
@@ -59,14 +57,19 @@ func main() {
 			defer wg.Done()
 			args := &Args{Num1: i, Num2: i + 1}
 			var reply int
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			if err = client.Call(ctx, "Foo.Sum", args, &reply); err != nil {
+			if err = c.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
 				log.Fatalln("调用 Foo.Sum 出错 err: ", err)
 			}
 			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
 		}(i)
+		time.Sleep(time.Second)
 	}
 	wg.Wait()
-	log.Println("程序运行完毕!")
+}
+
+func main() {
+	log.SetFlags(0)
+	ch := make(chan string)
+	go call(ch)
+	startServer(ch)
 }

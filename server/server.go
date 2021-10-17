@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -229,4 +230,40 @@ func Accept(lis net.Listener) {
 // Register 服务注册
 func Register(rcvr interface{}) error {
 	return DefaultServer.Register(rcvr)
+}
+
+const (
+	CONNECTED        = "200 Connected to go-rpc"
+	DefaultRpcPath   = "/_gorpc_"
+	DefaultDebugPath = "/debug/gorpc"
+)
+
+// ServeHTTP 实现 http.Handler 的接口作为 RPC 请求的响应
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 只允许接收CONNECT请求
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Println("rpc劫持出错 ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+CONNECTED+"\n\n")
+	s.ServeConn(conn)
+}
+
+// HandleHTTP 将默认rpc地址 DefaultRpcPath 注册到 HTTP Handler 中
+func (s *Server) HandleHTTP() {
+	http.Handle(DefaultRpcPath, s)
+	http.Handle(DefaultDebugPath, debugHTTP{s})
+	log.Println("rpc server debug path: ", DefaultDebugPath)
+}
+
+// HandleHTTP 默认服务器注册HTTP的方法
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

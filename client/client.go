@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,11 +9,14 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"gorpc/codec"
 	"gorpc/option"
+	"gorpc/server"
 )
 
 // Call 承载一次 rpc 调用
@@ -250,7 +254,7 @@ type clientResult struct {
 
 type newClientFunc func(conn net.Conn, opt *option.Option) (client *Client, err error)
 
-func dialTimout(f newClientFunc, network, address string, opts ...*option.Option) (client *Client, err error) {
+func dialTimeout(f newClientFunc, network, address string, opts ...*option.Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
@@ -283,6 +287,43 @@ func dialTimout(f newClientFunc, network, address string, opts ...*option.Option
 }
 
 // Dial 通过 network 和 address 连接 rpc 服务器
-func Dial(network, address string, opts ...*option.Option) (client *Client, err error) {
-	return dialTimout(NewClient, network, address, opts...)
+func Dial(network, address string, opts ...*option.Option) (*Client, error) {
+	return dialTimeout(NewClient, network, address, opts...)
+}
+
+// NewHTTPClient 创建可以接收HTTP协议的客户端
+func NewHTTPClient(conn net.Conn, opt *option.Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", server.DefaultRpcPath))
+	// 接收HTTP成功后, 切换为RPC协议
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == server.CONNECTED {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP 通过 HTTP 调用
+func DialHTTP(network, address string, opts ...*option.Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial 根据 rpcAddr 第一个参数选择不同的调用方式
+// rpcAddr 是一个通用的格式 (protocol@addr) 表示 rpc 服务端
+// 例如 http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/gorpc.sock
+func XDial(rpcAddr string, opts ...*option.Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client: 错误的格式 '%s', 应当为 protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix 或其他传输协议
+		return Dial(protocol, addr, opts...)
+	}
 }
