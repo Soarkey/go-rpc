@@ -29,7 +29,7 @@ type Server struct {
 func (s *Server) Register(rcvr interface{}) error {
 	svc := newService(rcvr)
 	if _, dup := s.serviceMap.LoadOrStore(svc.name, svc); dup {
-		return errors.New("rpc: 服务已经被定义 " + svc.name)
+		return errors.New("rpc server: 服务已经被定义 " + svc.name)
 	}
 	return nil
 }

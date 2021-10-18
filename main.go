@@ -125,4 +125,6 @@ func main() {
 	wg.Add(1)
 	simulateCall(registryAddr, "broadcast", &wg)
 	wg.Wait()
+
+	time.Sleep(5 * time.Minute)
 }

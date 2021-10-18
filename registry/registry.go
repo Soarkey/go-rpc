@@ -98,13 +98,14 @@ func Heartbeat(registry, addr string, duration time.Duration) {
 		// 确保在被移除之前有足够时间发送心跳
 		duration = time.Second // defaultTimeout - time.Duration(1)*time.Minute
 	}
-	var err error
-	err = sendHeartbeat(registry, addr)
+	// 利用定时器定时发送心跳
 	go func() {
+		var err error
+		err = sendHeartbeat(registry, addr)
 		t := time.NewTicker(duration)
-		if err != nil {
+		defer t.Stop()
+		for err != nil {
 			<-t.C
-			log.Println("=============>")
 			err = sendHeartbeat(registry, addr)
 		}
 	}()
